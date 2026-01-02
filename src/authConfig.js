@@ -4,11 +4,11 @@ export const msalConfig = {
   auth: {
     clientId: import.meta.env.VITE_CLIENT_ID,
     authority: import.meta.env.VITE_AUTHORITY,
-    redirectUri: window.location.origin, // e.g., http://localhost:5173
+    redirectUri: window.location.origin, // e.g., https://localhost:5173
     navigateToLoginRequestUrl: false,
   },
   cache: {
-    cacheLocation: "sessionStorage", // Safe and standard
+    cacheLocation: "sessionStorage",
     storeAuthStateInCookie: false,
   },
   system: {
@@ -22,7 +22,7 @@ export const msalConfig = {
             console.error(message);
             return;
           case LogLevel.Info:
-            // console.info(message); // Uncomment for debugging
+            // console.info(message);
             return;
           case LogLevel.Verbose:
             // console.debug(message);
@@ -38,8 +38,9 @@ export const msalConfig = {
   },
 };
 
-// Scopes we need to ask the user for.
-// "openid" and "profile" are standard.
+// UPDATED SCOPES:
+// We use the Client ID as the scope to request a token for THIS application.
+// This ensures Azure includes custom extension attributes in the token.
 export const loginRequest = {
-  scopes: ["openid", "profile", "offline_access"],
+  scopes: [`${import.meta.env.VITE_CLIENT_ID}/.default`],
 };

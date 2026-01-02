@@ -1,77 +1,164 @@
 import { useEffect, useState } from "react";
 import { useMsal, useIsAuthenticated } from "@azure/msal-react";
 import { loginRequest } from "./authConfig";
+import axios from "axios";
 import SuperAdminDashboard from "./components/SuperAdminDashboard";
 import TenantDashboard from "./components/TenantDashboard";
 import "./App.css";
+
+// HELPER: Decode Token Payload without a library
+function parseJwt(token) {
+  try {
+    return JSON.parse(atob(token.split(".")[1]));
+  } catch (e) {
+    return {};
+  }
+}
 
 function App() {
   const { instance, accounts } = useMsal();
   const isAuthenticated = useIsAuthenticated();
   const [token, setToken] = useState(null);
-  const [loadingToken, setLoadingToken] = useState(false);
+  const [userClaims, setUserClaims] = useState({});
+  const [loading, setLoading] = useState(true);
 
-  // 1. ROBUST TOKEN FETCHING (Fixes "Authenticating..." freeze)
+  // TENANT STATE
+  const [subdomain, setSubdomain] = useState(null);
+  const [tenantConfig, setTenantConfig] = useState(null);
+  const [configError, setConfigError] = useState("");
+
+  // 1. DETECT SUBDOMAIN
+  useEffect(() => {
+    const hostname = window.location.hostname;
+    const parts = hostname.split(".");
+    let currentSub = null;
+
+    if (hostname.includes("localhost")) {
+      if (parts.length > 1) currentSub = parts[0];
+    } else {
+      if (parts.length > 2) currentSub = parts[0];
+    }
+
+    if (!currentSub || currentSub === "www" || currentSub === "localhost") {
+      setSubdomain(null);
+      setLoading(false);
+      return;
+    }
+
+    setSubdomain(currentSub);
+
+    const fetchConfig = async () => {
+      try {
+        const res = await axios.get(
+          `${import.meta.env.VITE_API_URL}/api/public/config/${currentSub}`
+        );
+        setTenantConfig(res.data);
+      } catch (err) {
+        console.error(err);
+        setConfigError("Hospital Portal Not Found");
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchConfig();
+  }, []);
+
+  // 2. TOKEN ACQUISITION & DECODING
   useEffect(() => {
     const getToken = async () => {
       if (accounts.length > 0) {
-        setLoadingToken(true);
         try {
-          // Silent Request: Checks cache first, then asks Microsoft
           const response = await instance.acquireTokenSilent({
             ...loginRequest,
             account: accounts[0],
           });
-          setToken(response.idToken); // Use idToken for simple Auth, or accessToken for API
+
+          setToken(response.accessToken);
+
+          const decoded = parseJwt(response.accessToken);
+          console.log("------------------------------------------------");
+          console.log("DEBUG: FULL DECODED TOKEN:");
+          console.log(JSON.stringify(decoded, null, 2));
+          console.log("-------------------------------------------------");
+          setUserClaims(decoded);
         } catch (error) {
-          console.error("Silent Token Acquisition Failed", error);
-          // Fallback: If silent fails (session expired), user must sign in again
           if (error.name === "InteractionRequiredAuthError") {
             instance.loginPopup(loginRequest).catch(console.error);
           }
-        } finally {
-          setLoadingToken(false);
         }
       }
     };
-
-    if (isAuthenticated) {
-      getToken();
-    }
+    if (isAuthenticated) getToken();
   }, [isAuthenticated, accounts, instance]);
-
-  // 2. CHECK ROLE
-  // Note: We check specifically for the Super Admin email pattern
-  const isSuperAdmin = accounts[0]?.username?.startsWith("superadmin");
 
   const handleLogin = () => {
     instance
-      .loginPopup({
-        ...loginRequest,
-        prompt: "login", // <--- This forces a fresh login every time
-      })
-      .catch((e) => console.error(e));
+      .loginPopup({ ...loginRequest, prompt: "login" })
+      .catch(console.error);
   };
 
   const handleLogout = () => {
-    // 1. Clear Local Storage to kill the app's memory of the user
     localStorage.clear();
     sessionStorage.clear();
-
-    // 2. Determine exactly who we want to log out
     const activeAccount = instance.getActiveAccount() || accounts[0];
-
-    // 3. Force Azure to target THIS account
     instance.logoutRedirect({
       account: activeAccount,
-      // passing logoutHint is the key fix for sticky sessions
-      logoutHint:
-        activeAccount?.idTokenClaims?.login_hint || activeAccount?.username,
+      logoutHint: activeAccount?.idTokenClaims?.login_hint,
       postLogoutRedirectUri: window.location.origin,
     });
   };
 
-  // 4. RENDER LOGIC
+  // 4. SECURITY CHECK (The "Bouncer")
+  if (isAuthenticated && subdomain && tenantConfig && token) {
+    // UPDATED LOGIC: Check both "TenantId" AND "extension_..._TenantId"
+    let userTenantId = userClaims.TenantId; // Priority 1: Clean Name
+
+    if (!userTenantId) {
+      // Priority 2: Extension Name
+      const tenantKey = Object.keys(userClaims).find(
+        (key) => key.startsWith("extension_") && key.endsWith("_TenantId")
+      );
+      if (tenantKey) {
+        userTenantId = userClaims[tenantKey];
+      }
+    }
+
+    const isSuperAdmin = accounts[0]?.username?.startsWith("superadmin");
+
+    if (!isSuperAdmin && userTenantId !== subdomain) {
+      return (
+        <div style={{ textAlign: "center", padding: "50px" }}>
+          <h2 style={{ color: "red" }}>Access Denied</h2>
+          <p>
+            You are logged in as <strong>{accounts[0].username}</strong>.
+          </p>
+          <p>
+            This account belongs to{" "}
+            <strong>{userTenantId || "Unknown Tenant"}</strong>.
+          </p>
+          <p>
+            You are trying to access <strong>{subdomain}</strong>.
+          </p>
+          <button
+            onClick={handleLogout}
+            style={{ padding: "10px", marginTop: "20px" }}
+          >
+            Sign Out
+          </button>
+        </div>
+      );
+    }
+  }
+
+  if (loading) return <div style={{ padding: "50px" }}>Loading Portal...</div>;
+  if (configError)
+    return (
+      <div style={{ padding: "50px", color: "red" }}>
+        <h1>404</h1>
+        <p>{configError}</p>
+      </div>
+    );
+
   return (
     <div className="card">
       <header
@@ -80,9 +167,28 @@ function App() {
           justifyContent: "space-between",
           alignItems: "center",
           marginBottom: "20px",
+          borderBottom: "1px solid #eee",
+          paddingBottom: "15px",
         }}
       >
-        <h1 style={{ margin: 0 }}>Maz-Med Portal</h1>
+        <div style={{ display: "flex", alignItems: "center" }}>
+          {subdomain && tenantConfig ? (
+            <>
+              {tenantConfig.LogoUrl && (
+                <img
+                  src={tenantConfig.LogoUrl}
+                  alt="Logo"
+                  style={{ height: "40px", marginRight: "15px" }}
+                />
+              )}
+              <h1 style={{ margin: 0, fontSize: "24px" }}>
+                {tenantConfig.DisplayName}
+              </h1>
+            </>
+          ) : (
+            <h1 style={{ margin: 0 }}>Maz-Med Platform</h1>
+          )}
+        </div>
         {isAuthenticated && (
           <div style={{ textAlign: "right" }}>
             <span
@@ -106,25 +212,47 @@ function App() {
       </header>
 
       {!isAuthenticated ? (
-        <div className="login-container">
-          <p>Welcome to Maz-Med. Please sign in to access your portal.</p>
-          <button onClick={handleLogin}>Sign In</button>
+        <div
+          className="login-container"
+          style={{ textAlign: "center", padding: "40px" }}
+        >
+          {subdomain ? (
+            <div>
+              <h2>Welcome to {tenantConfig?.DisplayName}</h2>
+              <p>Authorized Staff Access Only</p>
+              <button
+                onClick={handleLogin}
+                style={{
+                  marginTop: "20px",
+                  padding: "10px 20px",
+                  fontSize: "16px",
+                }}
+              >
+                Sign In to {tenantConfig?.DisplayName}
+              </button>
+            </div>
+          ) : (
+            <div>
+              <h2>Platform Administration</h2>
+              <button onClick={handleLogin}>Sign In</button>
+            </div>
+          )}
         </div>
       ) : (
         <div className="main-content">
-          {/* Show loading state only while fetching the token */}
-          {loadingToken ? (
-            <p>Loading secure session...</p>
-          ) : token ? (
-            // Render the correct Dashboard based on Role
-            isSuperAdmin ? (
+          {token &&
+            (subdomain ? (
+              <TenantDashboard
+                token={token}
+                user={{ ...accounts[0], claims: userClaims }}
+              />
+            ) : accounts[0]?.username?.startsWith("superadmin") ? (
               <SuperAdminDashboard token={token} />
             ) : (
-              <TenantDashboard token={token} user={accounts[0]} />
-            )
-          ) : (
-            <p>Authentication failed. Please refresh.</p>
-          )}
+              <div>
+                <h3>Redirecting...</h3>
+              </div>
+            ))}
         </div>
       )}
     </div>
